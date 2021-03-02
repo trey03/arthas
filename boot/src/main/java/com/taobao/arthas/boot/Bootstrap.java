@@ -10,23 +10,25 @@ import java.security.CodeSource;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.InputMismatchException;
 import java.util.List;
+import java.util.Map;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
-import java.util.InputMismatchException;
 
 import javax.xml.parsers.ParserConfigurationException;
 
 import org.xml.sax.SAXException;
 
 import com.taobao.arthas.common.AnsiLog;
+import com.taobao.arthas.common.FeatureCodec;
 import com.taobao.arthas.common.JavaVersionUtils;
 import com.taobao.arthas.common.SocketUtils;
 import com.taobao.arthas.common.UsageRender;
 import com.taobao.middleware.cli.CLI;
 import com.taobao.middleware.cli.CommandLine;
-import com.taobao.middleware.cli.UsageMessageFormatter;
 import com.taobao.middleware.cli.annotations.Argument;
 import com.taobao.middleware.cli.annotations.CLIConfigurator;
 import com.taobao.middleware.cli.annotations.Description;
@@ -44,7 +46,7 @@ import com.taobao.middleware.cli.annotations.Summary;
                 + "  java -jar arthas-boot.jar --telnet-port 9999 --http-port -1\n"
                 + "  java -jar arthas-boot.jar -c 'sysprop; thread' <pid>\n"
                 + "  java -jar arthas-boot.jar -f batch.as <pid>\n"
-                + "  java -jar arthas-boot.jar --use-version 3.1.0\n"
+                + "  java -jar arthas-boot.jar --use-version 3.1.1\n"
                 + "  java -jar arthas-boot.jar --versions\n"
                 + "  java -jar arthas-boot.jar --session-timeout 3600\n" + "  java -jar arthas-boot.jar --attach-only\n"
                 + "  java -jar arthas-boot.jar --repo-mirror aliyun --use-http\n" + "WIKI:\n"
@@ -53,8 +55,7 @@ public class Bootstrap {
     private static final int DEFAULT_TELNET_PORT = 3658;
     private static final int DEFAULT_HTTP_PORT = 8563;
     private static final String DEFAULT_TARGET_IP = "127.0.0.1";
-    private static final File ARTHAS_LIB_DIR = new File(
-                    System.getProperty("user.home") + File.separator + ".arthas" + File.separator + "lib");
+    private static File ARTHAS_LIB_DIR;
 
     private boolean help = false;
 
@@ -74,7 +75,7 @@ public class Bootstrap {
 
     /**
      * <pre>
-     * The directory contains arthas-core.jar/arthas-client.jar/arthas-spy.jar.
+     * The directory contains arthas-client.jar/arthas-spy.jar.
      * 1. When use-version is not empty, try to find arthas home under ~/.arthas/lib
      * 2. Try set the directory where arthas-boot.jar is located to arthas home
      * 3. Try to download from maven repo
@@ -106,6 +107,28 @@ public class Bootstrap {
 
     private String command;
     private String batchFile;
+
+    static {
+        ARTHAS_LIB_DIR = new File(
+                System.getProperty("user.home") + File.separator + ".arthas" + File.separator + "lib");
+        try {
+            ARTHAS_LIB_DIR.mkdirs();
+        } catch (Throwable t) {
+            //ignore
+        }
+        if (!ARTHAS_LIB_DIR.exists()) {
+            // try to set a temp directory
+            ARTHAS_LIB_DIR = new File(System.getProperty("java.io.tmpdir") + File.separator + ".arthas" + File.separator + "lib");
+            try {
+                ARTHAS_LIB_DIR.mkdirs();
+            } catch (Throwable e) {
+                // ignore
+            }
+        }
+        if (!ARTHAS_LIB_DIR.exists()) {
+            System.err.println("Can not find directory to save arthas lib. please try to set user home by -Duser.home=");
+        }
+    }
 
     @Argument(argName = "pid", index = 0, required = false)
     @Description("Target pid")
@@ -231,7 +254,7 @@ public class Bootstrap {
             CLIConfigurator.inject(commandLine, bootstrap);
         } catch (Throwable e) {
             e.printStackTrace();
-            System.out.println(usage(cli));
+            System.out.println(CLIUtils.usage(cli));
             System.exit(1);
         }
 
@@ -239,7 +262,7 @@ public class Bootstrap {
             AnsiLog.level(Level.ALL);
         }
         if (bootstrap.isHelp()) {
-            System.out.println(usage(cli));
+            System.out.println(CLIUtils.usage(cli));
             System.exit(0);
         }
 
@@ -300,7 +323,7 @@ public class Bootstrap {
         if (telnetPortPid > 0 && pid != telnetPortPid) {
             AnsiLog.error("Target process {} is not the process using port {}, you will connect to an unexpected process.",
                             pid, bootstrap.getTelnetPort());
-            AnsiLog.error("1. Try to restart arthas-boot, select process {}, shutdown it first.",
+            AnsiLog.error("1. Try to restart arthas-boot, select process {}, shutdown it first with running the 'shutdown' command.",
                             telnetPortPid);
             AnsiLog.error("2. Or try to use different telnet port, for example: java -jar arthas-boot.jar --telnet-port 9998 --http-port -1");
             System.exit(1);
@@ -309,7 +332,7 @@ public class Bootstrap {
         if (httpPortPid > 0 && pid != httpPortPid) {
             AnsiLog.error("Target process {} is not the process using port {}, you will connect to an unexpected process.",
                             pid, bootstrap.getHttpPort());
-            AnsiLog.error("1. Try to restart arthas-boot, select process {}, shutdown it first.",
+            AnsiLog.error("1. Try to restart arthas-boot, select process {}, shutdown it first with running the 'shutdown' command.",
                             httpPortPid);
             AnsiLog.error("2. Or try to use different http port, for example: java -jar arthas-boot.jar --telnet-port 9998 --http-port 9999", httpPortPid);
             System.exit(1);
@@ -416,30 +439,22 @@ public class Bootstrap {
         if (telnetPortPid > 0 && pid == telnetPortPid) {
             AnsiLog.info("The target process already listen port {}, skip attach.", bootstrap.getTelnetPort());
         } else {
-            // start arthas-core.jar
-            List<String> attachArgs = new ArrayList<String>();
-            attachArgs.add("-jar");
-            attachArgs.add(new File(arthasHomeDir, "arthas-core.jar").getAbsolutePath());
-            attachArgs.add("-pid");
-            attachArgs.add("" + pid);
-            attachArgs.add("-target-ip");
-            attachArgs.add(bootstrap.getTargetIp());
-            attachArgs.add("-telnet-port");
-            attachArgs.add("" + bootstrap.getTelnetPort());
-            attachArgs.add("-http-port");
-            attachArgs.add("" + bootstrap.getHttpPort());
-            attachArgs.add("-core");
-            attachArgs.add(new File(arthasHomeDir, "arthas-core.jar").getAbsolutePath());
-            attachArgs.add("-agent");
-            attachArgs.add(new File(arthasHomeDir, "arthas-agent.jar").getAbsolutePath());
+            // start attach target process
+            FeatureCodec codec = new FeatureCodec(';', '=');
+
+            Map<String, String> configMap = new HashMap<String, String>();
+            configMap.put("target-ip", bootstrap.getTargetIp());
+            configMap.put("telnet-port", "" + bootstrap.getTelnetPort());
+            configMap.put("http-port", "" + bootstrap.getHttpPort());
             if (bootstrap.getSessionTimeout() != null) {
-                attachArgs.add("-session-timeout");
-                attachArgs.add("" + bootstrap.getSessionTimeout());
+                configMap.put("session-timeout", "" + bootstrap.getSessionTimeout());
             }
 
+            String attachConfig = codec.toString(configMap);
+
             AnsiLog.info("Try to attach process " + pid);
-            AnsiLog.debug("Start arthas-core.jar args: " + attachArgs);
-            ProcessUtils.startArthasCore(pid, attachArgs);
+            AnsiLog.debug("Attach config: " + attachConfig);
+            ProcessUtils.startAttach(pid, new File(arthasHomeDir, "arthas-agent.jar").getAbsolutePath(), attachConfig);
 
             AnsiLog.info("Attach process {} success.", pid);
         }
@@ -524,7 +539,7 @@ public class Bootstrap {
     private static void verifyArthasHome(String arthasHome) {
         File home = new File(arthasHome);
         if (home.isDirectory()) {
-            String[] fileList = { "arthas-core.jar", "arthas-agent.jar", "arthas-spy.jar" };
+            String[] fileList = { "arthas-agent.jar", "arthas-spy.jar" };
 
             for (String fileName : fileList) {
                 if (!new File(home, fileName).exists()) {
@@ -536,14 +551,6 @@ public class Bootstrap {
         }
 
         throw new IllegalArgumentException("illegal arthas home: " + home.getAbsolutePath());
-    }
-
-    private static String usage(CLI cli) {
-        StringBuilder usageStringBuilder = new StringBuilder();
-        UsageMessageFormatter usageMessageFormatter = new UsageMessageFormatter();
-        usageMessageFormatter.setOptionComparator(null);
-        cli.usage(usageStringBuilder, usageMessageFormatter);
-        return UsageRender.render(usageStringBuilder.toString());
     }
 
     public String getArthasHome() {
